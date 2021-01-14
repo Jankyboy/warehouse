@@ -12,10 +12,11 @@
 
 import datetime
 
-import attr
 import celery.exceptions
 import pretend
 import pytest
+
+from sqlalchemy.orm.exc import NoResultFound
 
 from warehouse import email
 from warehouse.accounts.interfaces import ITokenService, IUserService
@@ -60,6 +61,42 @@ def test_compute_recipient(user, address, expected):
     assert email._compute_recipient(user, email_) == expected
 
 
+@pytest.mark.parametrize(
+    ("unauthenticated_userid", "user", "expected"),
+    [
+        ("the_users_id", None, False),
+        ("some_other_id", None, True),
+        (None, pretend.stub(id="the_users_id"), False),
+        (None, pretend.stub(id="some_other_id"), True),
+        (None, None, False),
+    ],
+)
+def test_redact_ip(unauthenticated_userid, user, expected):
+    user_email = pretend.stub(user_id="the_users_id")
+
+    request = pretend.stub(
+        unauthenticated_userid=unauthenticated_userid,
+        user=user,
+        db=pretend.stub(
+            query=lambda a: pretend.stub(
+                filter=lambda a: pretend.stub(one=lambda: user_email)
+            )
+        ),
+    )
+    assert email._redact_ip(request, user_email) == expected
+
+
+def test_redact_ip_email_not_found():
+    request = pretend.stub(
+        db=pretend.stub(
+            query=lambda a: pretend.stub(
+                filter=lambda a: pretend.stub(one=pretend.raiser(NoResultFound))
+            )
+        )
+    )
+    assert email._redact_ip(request, "doesn't matter") is False
+
+
 class TestSendEmailToUser:
     @pytest.mark.parametrize(
         ("name", "username", "primary_email", "address", "expected"),
@@ -82,7 +119,7 @@ class TestSendEmailToUser:
         ],
     )
     def test_sends_to_user_with_verified(
-        self, name, username, primary_email, address, expected
+        self, name, username, primary_email, address, expected, pyramid_request
     ):
         user = pretend.stub(
             name=name,
@@ -92,28 +129,25 @@ class TestSendEmailToUser:
         )
 
         task = pretend.stub(delay=pretend.call_recorder(lambda *a, **kw: None))
-        request = pretend.stub(
-            task=pretend.call_recorder(lambda x: task),
-            db=pretend.stub(
-                query=lambda a: pretend.stub(
-                    filter=lambda *a: pretend.stub(
-                        one=lambda: pretend.stub(user_id=user.id)
-                    )
-                ),
+        pyramid_request.task = pretend.call_recorder(lambda x: task)
+        pyramid_request.db = pretend.stub(
+            query=lambda a: pretend.stub(
+                filter=lambda *a: pretend.stub(
+                    one=lambda: pretend.stub(user_id=user.id)
+                )
             ),
-            remote_addr="0.0.0.0",
-            user=user,
-            registry=pretend.stub(settings={"mail.sender": "noreply@example.com"}),
         )
+        pyramid_request.user = user
+        pyramid_request.registry.settings = {"mail.sender": "noreply@example.com"}
 
         if address is not None:
             address = pretend.stub(email=address, verified=True)
 
         msg = EmailMessage(subject="My Subject", body_text="My Body")
 
-        email._send_email_to_user(request, user, msg, email=address)
+        email._send_email_to_user(pyramid_request, user, msg, email=address)
 
-        assert request.task.calls == [pretend.call(email.send_email)]
+        assert pyramid_request.task.calls == [pretend.call(email.send_email)]
         assert task.delay.calls == [
             pretend.call(
                 expected,
@@ -121,7 +155,7 @@ class TestSendEmailToUser:
                 {
                     "tag": "account:email:sent",
                     "user_id": user.id,
-                    "ip_address": request.remote_addr,
+                    "ip_address": pyramid_request.remote_addr,
                     "additional": {
                         "from_": "noreply@example.com",
                         "to": address.email if address else primary_email,
@@ -172,7 +206,7 @@ class TestSendEmailToUser:
         ],
     )
     def test_sends_unverified_with_override(
-        self, username, primary_email, address, expected
+        self, username, primary_email, address, expected, pyramid_request
     ):
         user = pretend.stub(
             username=username,
@@ -184,19 +218,16 @@ class TestSendEmailToUser:
         )
 
         task = pretend.stub(delay=pretend.call_recorder(lambda *a, **kw: None))
-        request = pretend.stub(
-            task=pretend.call_recorder(lambda x: task),
-            db=pretend.stub(
-                query=lambda a: pretend.stub(
-                    filter=lambda *a: pretend.stub(
-                        one=lambda: pretend.stub(user_id=user.id)
-                    )
-                ),
+        pyramid_request.task = pretend.call_recorder(lambda x: task)
+        pyramid_request.db = pretend.stub(
+            query=lambda a: pretend.stub(
+                filter=lambda *a: pretend.stub(
+                    one=lambda: pretend.stub(user_id=user.id)
+                )
             ),
-            remote_addr="0.0.0.0",
-            user=user,
-            registry=pretend.stub(settings={"mail.sender": "noreply@example.com"}),
         )
+        pyramid_request.user = user
+        pyramid_request.registry.settings = {"mail.sender": "noreply@example.com"}
 
         if address is not None:
             address = pretend.stub(email=address, verified=False)
@@ -204,10 +235,10 @@ class TestSendEmailToUser:
         msg = EmailMessage(subject="My Subject", body_text="My Body")
 
         email._send_email_to_user(
-            request, user, msg, email=address, allow_unverified=True
+            pyramid_request, user, msg, email=address, allow_unverified=True
         )
 
-        assert request.task.calls == [pretend.call(email.send_email)]
+        assert pyramid_request.task.calls == [pretend.call(email.send_email)]
         assert task.delay.calls == [
             pretend.call(
                 expected,
@@ -215,7 +246,7 @@ class TestSendEmailToUser:
                 {
                     "tag": "account:email:sent",
                     "user_id": user.id,
-                    "ip_address": request.remote_addr,
+                    "ip_address": pyramid_request.remote_addr,
                     "additional": {
                         "from_": "noreply@example.com",
                         "to": address.email if address else primary_email,
@@ -276,7 +307,11 @@ class TestSendEmail:
             task,
             request,
             "recipient",
-            attr.asdict(msg),
+            {
+                "subject": msg.subject,
+                "body_text": msg.body_text,
+                "body_html": msg.body_html,
+            },
             {
                 "tag": "account:email:sent",
                 "user_id": user_id,
@@ -339,7 +374,11 @@ class TestSendEmail:
                 task,
                 request,
                 "recipient",
-                attr.asdict(msg),
+                {
+                    "subject": msg.subject,
+                    "body_text": msg.body_text,
+                    "body_html": msg.body_html,
+                },
                 {
                     "tag": "account:email:sent",
                     "user_id": user_id,
@@ -455,16 +494,14 @@ class TestSendPasswordResetEmail:
                 "name_value <"
                 + (stub_user.email if email_addr is None else email_addr)
                 + ">",
-                attr.asdict(
-                    EmailMessage(
-                        subject="Email Subject",
-                        body_text="Email Body",
-                        body_html=(
-                            "<html>\n<head></head>\n"
-                            "<body><p>Email HTML Body</p></body>\n</html>\n"
-                        ),
-                    )
-                ),
+                {
+                    "subject": "Email Subject",
+                    "body_text": "Email Body",
+                    "body_html": (
+                        "<html>\n<head></head>\n"
+                        "<body><p>Email HTML Body</p></body>\n</html>\n"
+                    ),
+                },
                 {
                     "tag": "account:email:sent",
                     "user_id": stub_user.id,
@@ -548,16 +585,14 @@ class TestEmailVerificationEmail:
         assert send_email.delay.calls == [
             pretend.call(
                 stub_email.email,
-                attr.asdict(
-                    EmailMessage(
-                        subject="Email Subject",
-                        body_text="Email Body",
-                        body_html=(
-                            "<html>\n<head></head>\n"
-                            "<body><p>Email HTML Body</p></body>\n</html>\n"
-                        ),
-                    )
-                ),
+                {
+                    "subject": "Email Subject",
+                    "body_text": "Email Body",
+                    "body_html": (
+                        "<html>\n<head></head>\n"
+                        "<body><p>Email HTML Body</p></body>\n</html>\n"
+                    ),
+                },
                 {
                     "tag": "account:email:sent",
                     "user_id": stub_user.id,
@@ -621,16 +656,14 @@ class TestPasswordChangeEmail:
         assert send_email.delay.calls == [
             pretend.call(
                 f"{stub_user.username} <{stub_user.email}>",
-                attr.asdict(
-                    EmailMessage(
-                        subject="Email Subject",
-                        body_text="Email Body",
-                        body_html=(
-                            "<html>\n<head></head>\n"
-                            "<body><p>Email HTML Body</p></body>\n</html>\n"
-                        ),
-                    )
-                ),
+                {
+                    "subject": "Email Subject",
+                    "body_text": "Email Body",
+                    "body_html": (
+                        "<html>\n<head></head>\n"
+                        "<body><p>Email HTML Body</p></body>\n</html>\n"
+                    ),
+                },
                 {
                     "tag": "account:email:sent",
                     "user_id": stub_user.id,
@@ -741,16 +774,14 @@ class TestPasswordCompromisedHIBPEmail:
         assert send_email.delay.calls == [
             pretend.call(
                 f"{stub_user.username} <{stub_user.email}>",
-                attr.asdict(
-                    EmailMessage(
-                        subject="Email Subject",
-                        body_text="Email Body",
-                        body_html=(
-                            "<html>\n<head></head>\n"
-                            "<body><p>Email HTML Body</p></body>\n</html>\n"
-                        ),
-                    )
-                ),
+                {
+                    "subject": "Email Subject",
+                    "body_text": "Email Body",
+                    "body_html": (
+                        "<html>\n<head></head>\n"
+                        "<body><p>Email HTML Body</p></body>\n</html>\n"
+                    ),
+                },
                 {
                     "tag": "account:email:sent",
                     "user_id": stub_user.id,
@@ -814,16 +845,14 @@ class TestPasswordCompromisedEmail:
         assert send_email.delay.calls == [
             pretend.call(
                 f"{stub_user.username} <{stub_user.email}>",
-                attr.asdict(
-                    EmailMessage(
-                        subject="Email Subject",
-                        body_text="Email Body",
-                        body_html=(
-                            "<html>\n<head></head>\n"
-                            "<body><p>Email HTML Body</p></body>\n</html>\n"
-                        ),
-                    )
-                ),
+                {
+                    "subject": "Email Subject",
+                    "body_text": "Email Body",
+                    "body_html": (
+                        "<html>\n<head></head>\n"
+                        "<body><p>Email HTML Body</p></body>\n</html>\n"
+                    ),
+                },
                 {
                     "tag": "account:email:sent",
                     "user_id": stub_user.id,
@@ -888,16 +917,14 @@ class TestAccountDeletionEmail:
         assert send_email.delay.calls == [
             pretend.call(
                 f"{stub_user.username} <{stub_user.email}>",
-                attr.asdict(
-                    EmailMessage(
-                        subject="Email Subject",
-                        body_text="Email Body",
-                        body_html=(
-                            "<html>\n<head></head>\n"
-                            "<body><p>Email HTML Body</p></body>\n</html>\n"
-                        ),
-                    )
-                ),
+                {
+                    "subject": "Email Subject",
+                    "body_text": "Email Body",
+                    "body_html": (
+                        "<html>\n<head></head>\n"
+                        "<body><p>Email HTML Body</p></body>\n</html>\n"
+                    ),
+                },
                 {
                     "tag": "account:email:sent",
                     "user_id": stub_user.id,
@@ -1016,16 +1043,14 @@ class TestPrimaryEmailChangeEmail:
         assert send_email.delay.calls == [
             pretend.call(
                 "username <old_email@example.com>",
-                attr.asdict(
-                    EmailMessage(
-                        subject="Email Subject",
-                        body_text="Email Body",
-                        body_html=(
-                            "<html>\n<head></head>\n"
-                            "<body><p>Email HTML Body</p></body>\n</html>\n"
-                        ),
-                    )
-                ),
+                {
+                    "subject": "Email Subject",
+                    "body_text": "Email Body",
+                    "body_html": (
+                        "<html>\n<head></head>\n"
+                        "<body><p>Email HTML Body</p></body>\n</html>\n"
+                    ),
+                },
                 {
                     "tag": "account:email:sent",
                     "user_id": stub_user.id,
@@ -1176,16 +1201,14 @@ class TestCollaboratorAddedEmail:
         assert send_email.delay.calls == [
             pretend.call(
                 "username <email@example.com>",
-                attr.asdict(
-                    EmailMessage(
-                        subject="Email Subject",
-                        body_text="Email Body",
-                        body_html=(
-                            "<html>\n<head></head>\n"
-                            "<body><p>Email HTML Body</p></body>\n</html>\n"
-                        ),
-                    )
-                ),
+                {
+                    "subject": "Email Subject",
+                    "body_text": "Email Body",
+                    "body_html": (
+                        "<html>\n<head></head>\n"
+                        "<body><p>Email HTML Body</p></body>\n</html>\n"
+                    ),
+                },
                 {
                     "tag": "account:email:sent",
                     "user_id": stub_user.id,
@@ -1200,16 +1223,14 @@ class TestCollaboratorAddedEmail:
             ),
             pretend.call(
                 "submitterusername <submiteremail@example.com>",
-                attr.asdict(
-                    EmailMessage(
-                        subject="Email Subject",
-                        body_text="Email Body",
-                        body_html=(
-                            "<html>\n<head></head>\n"
-                            "<body><p>Email HTML Body</p></body>\n</html>\n"
-                        ),
-                    )
-                ),
+                {
+                    "subject": "Email Subject",
+                    "body_text": "Email Body",
+                    "body_html": (
+                        "<html>\n<head></head>\n"
+                        "<body><p>Email HTML Body</p></body>\n</html>\n"
+                    ),
+                },
                 {
                     "tag": "account:email:sent",
                     "user_id": stub_submitter_user.id,
@@ -1302,16 +1323,14 @@ class TestCollaboratorAddedEmail:
         assert send_email.delay.calls == [
             pretend.call(
                 "submitterusername <submiteremail@example.com>",
-                attr.asdict(
-                    EmailMessage(
-                        subject="Email Subject",
-                        body_text="Email Body",
-                        body_html=(
-                            "<html>\n<head></head>\n"
-                            "<body><p>Email HTML Body</p></body>\n</html>\n"
-                        ),
-                    )
-                ),
+                {
+                    "subject": "Email Subject",
+                    "body_text": "Email Body",
+                    "body_html": (
+                        "<html>\n<head></head>\n"
+                        "<body><p>Email HTML Body</p></body>\n</html>\n"
+                    ),
+                },
                 {
                     "tag": "account:email:sent",
                     "user_id": stub_submitter_user.id,
@@ -1387,16 +1406,14 @@ class TestProjectRoleVerificationEmail:
         assert send_email.delay.calls == [
             pretend.call(
                 f"{stub_user.name} <{stub_user.email}>",
-                attr.asdict(
-                    EmailMessage(
-                        subject="Email Subject",
-                        body_text="Email Body",
-                        body_html=(
-                            "<html>\n<head></head>\n"
-                            "<body><p>Email HTML Body</p></body>\n</html>\n"
-                        ),
-                    )
-                ),
+                {
+                    "subject": "Email Subject",
+                    "body_text": "Email Body",
+                    "body_html": (
+                        "<html>\n<head></head>\n"
+                        "<body><p>Email HTML Body</p></body>\n</html>\n"
+                    ),
+                },
                 {
                     "tag": "account:email:sent",
                     "user_id": stub_user.id,
@@ -1465,32 +1482,30 @@ class TestAddedAsCollaboratorEmail:
         )
 
         assert result == {
-            "project": "test_project",
+            "project_name": "test_project",
             "role": "Owner",
-            "submitter": stub_submitter_user.username,
+            "initiator_username": stub_submitter_user.username,
         }
         subject_renderer.assert_()
-        body_renderer.assert_(submitter=stub_submitter_user.username)
-        body_renderer.assert_(project="test_project")
+        body_renderer.assert_(initiator_username=stub_submitter_user.username)
+        body_renderer.assert_(project_name="test_project")
         body_renderer.assert_(role="Owner")
-        html_renderer.assert_(submitter=stub_submitter_user.username)
-        html_renderer.assert_(project="test_project")
+        html_renderer.assert_(initiator_username=stub_submitter_user.username)
+        html_renderer.assert_(project_name="test_project")
         html_renderer.assert_(role="Owner")
 
         assert pyramid_request.task.calls == [pretend.call(send_email)]
         assert send_email.delay.calls == [
             pretend.call(
                 "username <email@example.com>",
-                attr.asdict(
-                    EmailMessage(
-                        subject="Email Subject",
-                        body_text="Email Body",
-                        body_html=(
-                            "<html>\n<head></head>\n"
-                            "<body><p>Email HTML Body</p></body>\n</html>\n"
-                        ),
-                    )
-                ),
+                {
+                    "subject": "Email Subject",
+                    "body_text": "Email Body",
+                    "body_html": (
+                        "<html>\n<head></head>\n"
+                        "<body><p>Email HTML Body</p></body>\n</html>\n"
+                    ),
+                },
                 {
                     "tag": "account:email:sent",
                     "user_id": stub_user.id,
@@ -1557,16 +1572,16 @@ class TestAddedAsCollaboratorEmail:
         )
 
         assert result == {
-            "project": "test_project",
+            "project_name": "test_project",
             "role": "Owner",
-            "submitter": stub_submitter_user.username,
+            "initiator_username": stub_submitter_user.username,
         }
         subject_renderer.assert_()
-        body_renderer.assert_(submitter=stub_submitter_user.username)
-        body_renderer.assert_(project="test_project")
+        body_renderer.assert_(initiator_username=stub_submitter_user.username)
+        body_renderer.assert_(project_name="test_project")
         body_renderer.assert_(role="Owner")
-        html_renderer.assert_(submitter=stub_submitter_user.username)
-        html_renderer.assert_(project="test_project")
+        html_renderer.assert_(initiator_username=stub_submitter_user.username)
+        html_renderer.assert_(project_name="test_project")
         html_renderer.assert_(role="Owner")
 
         assert pyramid_request.task.calls == []
@@ -1630,16 +1645,14 @@ class TestCollaboratorRemovedEmail:
         assert send_email.delay.calls == [
             pretend.call(
                 f"{ removed_user.name } <{ removed_user.primary_email.email }>",
-                attr.asdict(
-                    EmailMessage(
-                        subject="Email Subject",
-                        body_text="Email Body",
-                        body_html=(
-                            "<html>\n<head></head>\n"
-                            "<body><p>Email HTML Body</p></body>\n</html>\n"
-                        ),
-                    )
-                ),
+                {
+                    "subject": "Email Subject",
+                    "body_text": "Email Body",
+                    "body_html": (
+                        "<html>\n<head></head>\n"
+                        "<body><p>Email HTML Body</p></body>\n</html>\n"
+                    ),
+                },
                 {
                     "tag": "account:email:sent",
                     "user_id": removed_user.id,
@@ -1654,16 +1667,14 @@ class TestCollaboratorRemovedEmail:
             ),
             pretend.call(
                 f"{ submitter_user.name } <{ submitter_user.primary_email.email }>",
-                attr.asdict(
-                    EmailMessage(
-                        subject="Email Subject",
-                        body_text="Email Body",
-                        body_html=(
-                            "<html>\n<head></head>\n"
-                            "<body><p>Email HTML Body</p></body>\n</html>\n"
-                        ),
-                    )
-                ),
+                {
+                    "subject": "Email Subject",
+                    "body_text": "Email Body",
+                    "body_html": (
+                        "<html>\n<head></head>\n"
+                        "<body><p>Email HTML Body</p></body>\n</html>\n"
+                    ),
+                },
                 {
                     "tag": "account:email:sent",
                     "user_id": submitter_user.id,
@@ -1731,16 +1742,14 @@ class TestRemovedAsCollaboratorEmail:
         assert send_email.delay.calls == [
             pretend.call(
                 f"{ removed_user.name } <{ removed_user.primary_email.email }>",
-                attr.asdict(
-                    EmailMessage(
-                        subject="Email Subject",
-                        body_text="Email Body",
-                        body_html=(
-                            "<html>\n<head></head>\n"
-                            "<body><p>Email HTML Body</p></body>\n</html>\n"
-                        ),
-                    )
-                ),
+                {
+                    "subject": "Email Subject",
+                    "body_text": "Email Body",
+                    "body_html": (
+                        "<html>\n<head></head>\n"
+                        "<body><p>Email HTML Body</p></body>\n</html>\n"
+                    ),
+                },
                 {
                     "tag": "account:email:sent",
                     "user_id": removed_user.id,
@@ -1817,16 +1826,14 @@ class TestRoleChangedEmail:
         assert send_email.delay.calls == [
             pretend.call(
                 f"{ changed_user.name } <{ changed_user.primary_email.email }>",
-                attr.asdict(
-                    EmailMessage(
-                        subject="Email Subject",
-                        body_text="Email Body",
-                        body_html=(
-                            "<html>\n<head></head>\n"
-                            "<body><p>Email HTML Body</p></body>\n</html>\n"
-                        ),
-                    )
-                ),
+                {
+                    "subject": "Email Subject",
+                    "body_text": "Email Body",
+                    "body_html": (
+                        "<html>\n<head></head>\n"
+                        "<body><p>Email HTML Body</p></body>\n</html>\n"
+                    ),
+                },
                 {
                     "tag": "account:email:sent",
                     "user_id": changed_user.id,
@@ -1841,16 +1848,14 @@ class TestRoleChangedEmail:
             ),
             pretend.call(
                 f"{ submitter_user.name } <{ submitter_user.primary_email.email }>",
-                attr.asdict(
-                    EmailMessage(
-                        subject="Email Subject",
-                        body_text="Email Body",
-                        body_html=(
-                            "<html>\n<head></head>\n"
-                            "<body><p>Email HTML Body</p></body>\n</html>\n"
-                        ),
-                    )
-                ),
+                {
+                    "subject": "Email Subject",
+                    "body_text": "Email Body",
+                    "body_html": (
+                        "<html>\n<head></head>\n"
+                        "<body><p>Email HTML Body</p></body>\n</html>\n"
+                    ),
+                },
                 {
                     "tag": "account:email:sent",
                     "user_id": submitter_user.id,
@@ -1922,16 +1927,14 @@ class TestRoleChangedAsCollaboratorEmail:
         assert send_email.delay.calls == [
             pretend.call(
                 f"{ changed_user.name } <{ changed_user.primary_email.email }>",
-                attr.asdict(
-                    EmailMessage(
-                        subject="Email Subject",
-                        body_text="Email Body",
-                        body_html=(
-                            "<html>\n<head></head>\n"
-                            "<body><p>Email HTML Body</p></body>\n</html>\n"
-                        ),
-                    )
-                ),
+                {
+                    "subject": "Email Subject",
+                    "body_text": "Email Body",
+                    "body_html": (
+                        "<html>\n<head></head>\n"
+                        "<body><p>Email HTML Body</p></body>\n</html>\n"
+                    ),
+                },
                 {
                     "tag": "account:email:sent",
                     "user_id": changed_user.id,
@@ -2027,16 +2030,14 @@ class TestRemovedProjectEmail:
         assert send_email.delay.calls == [
             pretend.call(
                 "username <email@example.com>",
-                attr.asdict(
-                    EmailMessage(
-                        subject="Email Subject",
-                        body_text="Email Body",
-                        body_html=(
-                            "<html>\n<head></head>\n"
-                            "<body><p>Email HTML Body</p></body>\n</html>\n"
-                        ),
+                {
+                    "subject": "Email Subject",
+                    "body_text": "Email Body",
+                    "body_html": (
+                        "<html>\n<head></head>\n"
+                        "<body><p>Email HTML Body</p></body>\n</html>\n"
                     ),
-                ),
+                },
                 {
                     "tag": "account:email:sent",
                     "user_id": stub_user.id,
@@ -2051,16 +2052,14 @@ class TestRemovedProjectEmail:
             ),
             pretend.call(
                 "submitterusername <submiteremail@example.com>",
-                attr.asdict(
-                    EmailMessage(
-                        subject="Email Subject",
-                        body_text="Email Body",
-                        body_html=(
-                            "<html>\n<head></head>\n"
-                            "<body><p>Email HTML Body</p></body>\n</html>\n"
-                        ),
-                    )
-                ),
+                {
+                    "subject": "Email Subject",
+                    "body_text": "Email Body",
+                    "body_html": (
+                        "<html>\n<head></head>\n"
+                        "<body><p>Email HTML Body</p></body>\n</html>\n"
+                    ),
+                },
                 {
                     "tag": "account:email:sent",
                     "user_id": stub_submitter_user.id,
@@ -2154,16 +2153,14 @@ class TestRemovedProjectEmail:
         assert send_email.delay.calls == [
             pretend.call(
                 "username <email@example.com>",
-                attr.asdict(
-                    EmailMessage(
-                        subject="Email Subject",
-                        body_text="Email Body",
-                        body_html=(
-                            "<html>\n<head></head>\n"
-                            "<body><p>Email HTML Body</p></body>\n</html>\n"
-                        ),
+                {
+                    "subject": "Email Subject",
+                    "body_text": "Email Body",
+                    "body_html": (
+                        "<html>\n<head></head>\n"
+                        "<body><p>Email HTML Body</p></body>\n</html>\n"
                     ),
-                ),
+                },
                 {
                     "tag": "account:email:sent",
                     "user_id": stub_user.id,
@@ -2178,16 +2175,14 @@ class TestRemovedProjectEmail:
             ),
             pretend.call(
                 "submitterusername <submiteremail@example.com>",
-                attr.asdict(
-                    EmailMessage(
-                        subject="Email Subject",
-                        body_text="Email Body",
-                        body_html=(
-                            "<html>\n<head></head>\n"
-                            "<body><p>Email HTML Body</p></body>\n</html>\n"
-                        ),
-                    )
-                ),
+                {
+                    "subject": "Email Subject",
+                    "body_text": "Email Body",
+                    "body_html": (
+                        "<html>\n<head></head>\n"
+                        "<body><p>Email HTML Body</p></body>\n</html>\n"
+                    ),
+                },
                 {
                     "tag": "account:email:sent",
                     "user_id": stub_submitter_user.id,
@@ -2297,16 +2292,14 @@ class TestYankedReleaseEmail:
         assert send_email.delay.calls == [
             pretend.call(
                 "username <email@example.com>",
-                attr.asdict(
-                    EmailMessage(
-                        subject="Email Subject",
-                        body_text="Email Body",
-                        body_html=(
-                            "<html>\n<head></head>\n"
-                            "<body><p>Email HTML Body</p></body>\n</html>\n"
-                        ),
+                {
+                    "subject": "Email Subject",
+                    "body_text": "Email Body",
+                    "body_html": (
+                        "<html>\n<head></head>\n"
+                        "<body><p>Email HTML Body</p></body>\n</html>\n"
                     ),
-                ),
+                },
                 {
                     "tag": "account:email:sent",
                     "user_id": stub_user.id,
@@ -2321,16 +2314,14 @@ class TestYankedReleaseEmail:
             ),
             pretend.call(
                 "submitterusername <submiteremail@example.com>",
-                attr.asdict(
-                    EmailMessage(
-                        subject="Email Subject",
-                        body_text="Email Body",
-                        body_html=(
-                            "<html>\n<head></head>\n"
-                            "<body><p>Email HTML Body</p></body>\n</html>\n"
-                        ),
-                    )
-                ),
+                {
+                    "subject": "Email Subject",
+                    "body_text": "Email Body",
+                    "body_html": (
+                        "<html>\n<head></head>\n"
+                        "<body><p>Email HTML Body</p></body>\n</html>\n"
+                    ),
+                },
                 {
                     "tag": "account:email:sent",
                     "user_id": stub_submitter_user.id,
@@ -2438,16 +2429,14 @@ class TestYankedReleaseEmail:
         assert send_email.delay.calls == [
             pretend.call(
                 "username <email@example.com>",
-                attr.asdict(
-                    EmailMessage(
-                        subject="Email Subject",
-                        body_text="Email Body",
-                        body_html=(
-                            "<html>\n<head></head>\n"
-                            "<body><p>Email HTML Body</p></body>\n</html>\n"
-                        ),
+                {
+                    "subject": "Email Subject",
+                    "body_text": "Email Body",
+                    "body_html": (
+                        "<html>\n<head></head>\n"
+                        "<body><p>Email HTML Body</p></body>\n</html>\n"
                     ),
-                ),
+                },
                 {
                     "tag": "account:email:sent",
                     "user_id": stub_user.id,
@@ -2462,16 +2451,14 @@ class TestYankedReleaseEmail:
             ),
             pretend.call(
                 "submitterusername <submiteremail@example.com>",
-                attr.asdict(
-                    EmailMessage(
-                        subject="Email Subject",
-                        body_text="Email Body",
-                        body_html=(
-                            "<html>\n<head></head>\n"
-                            "<body><p>Email HTML Body</p></body>\n</html>\n"
-                        ),
-                    )
-                ),
+                {
+                    "subject": "Email Subject",
+                    "body_text": "Email Body",
+                    "body_html": (
+                        "<html>\n<head></head>\n"
+                        "<body><p>Email HTML Body</p></body>\n</html>\n"
+                    ),
+                },
                 {
                     "tag": "account:email:sent",
                     "user_id": stub_submitter_user.id,
@@ -2580,16 +2567,14 @@ class TestUnyankedReleaseEmail:
         assert send_email.delay.calls == [
             pretend.call(
                 "username <email@example.com>",
-                attr.asdict(
-                    EmailMessage(
-                        subject="Email Subject",
-                        body_text="Email Body",
-                        body_html=(
-                            "<html>\n<head></head>\n"
-                            "<body><p>Email HTML Body</p></body>\n</html>\n"
-                        ),
+                {
+                    "subject": "Email Subject",
+                    "body_text": "Email Body",
+                    "body_html": (
+                        "<html>\n<head></head>\n"
+                        "<body><p>Email HTML Body</p></body>\n</html>\n"
                     ),
-                ),
+                },
                 {
                     "tag": "account:email:sent",
                     "user_id": stub_user.id,
@@ -2604,16 +2589,14 @@ class TestUnyankedReleaseEmail:
             ),
             pretend.call(
                 "submitterusername <submiteremail@example.com>",
-                attr.asdict(
-                    EmailMessage(
-                        subject="Email Subject",
-                        body_text="Email Body",
-                        body_html=(
-                            "<html>\n<head></head>\n"
-                            "<body><p>Email HTML Body</p></body>\n</html>\n"
-                        ),
-                    )
-                ),
+                {
+                    "subject": "Email Subject",
+                    "body_text": "Email Body",
+                    "body_html": (
+                        "<html>\n<head></head>\n"
+                        "<body><p>Email HTML Body</p></body>\n</html>\n"
+                    ),
+                },
                 {
                     "tag": "account:email:sent",
                     "user_id": stub_submitter_user.id,
@@ -2720,16 +2703,14 @@ class TestUnyankedReleaseEmail:
         assert send_email.delay.calls == [
             pretend.call(
                 "username <email@example.com>",
-                attr.asdict(
-                    EmailMessage(
-                        subject="Email Subject",
-                        body_text="Email Body",
-                        body_html=(
-                            "<html>\n<head></head>\n"
-                            "<body><p>Email HTML Body</p></body>\n</html>\n"
-                        ),
+                {
+                    "subject": "Email Subject",
+                    "body_text": "Email Body",
+                    "body_html": (
+                        "<html>\n<head></head>\n"
+                        "<body><p>Email HTML Body</p></body>\n</html>\n"
                     ),
-                ),
+                },
                 {
                     "tag": "account:email:sent",
                     "user_id": stub_user.id,
@@ -2744,16 +2725,14 @@ class TestUnyankedReleaseEmail:
             ),
             pretend.call(
                 "submitterusername <submiteremail@example.com>",
-                attr.asdict(
-                    EmailMessage(
-                        subject="Email Subject",
-                        body_text="Email Body",
-                        body_html=(
-                            "<html>\n<head></head>\n"
-                            "<body><p>Email HTML Body</p></body>\n</html>\n"
-                        ),
-                    )
-                ),
+                {
+                    "subject": "Email Subject",
+                    "body_text": "Email Body",
+                    "body_html": (
+                        "<html>\n<head></head>\n"
+                        "<body><p>Email HTML Body</p></body>\n</html>\n"
+                    ),
+                },
                 {
                     "tag": "account:email:sent",
                     "user_id": stub_submitter_user.id,
@@ -2862,16 +2841,14 @@ class TestRemovedReleaseEmail:
         assert send_email.delay.calls == [
             pretend.call(
                 "username <email@example.com>",
-                attr.asdict(
-                    EmailMessage(
-                        subject="Email Subject",
-                        body_text="Email Body",
-                        body_html=(
-                            "<html>\n<head></head>\n"
-                            "<body><p>Email HTML Body</p></body>\n</html>\n"
-                        ),
+                {
+                    "subject": "Email Subject",
+                    "body_text": "Email Body",
+                    "body_html": (
+                        "<html>\n<head></head>\n"
+                        "<body><p>Email HTML Body</p></body>\n</html>\n"
                     ),
-                ),
+                },
                 {
                     "tag": "account:email:sent",
                     "user_id": stub_user.id,
@@ -2886,16 +2863,14 @@ class TestRemovedReleaseEmail:
             ),
             pretend.call(
                 "submitterusername <submiteremail@example.com>",
-                attr.asdict(
-                    EmailMessage(
-                        subject="Email Subject",
-                        body_text="Email Body",
-                        body_html=(
-                            "<html>\n<head></head>\n"
-                            "<body><p>Email HTML Body</p></body>\n</html>\n"
-                        ),
-                    )
-                ),
+                {
+                    "subject": "Email Subject",
+                    "body_text": "Email Body",
+                    "body_html": (
+                        "<html>\n<head></head>\n"
+                        "<body><p>Email HTML Body</p></body>\n</html>\n"
+                    ),
+                },
                 {
                     "tag": "account:email:sent",
                     "user_id": stub_submitter_user.id,
@@ -3002,16 +2977,14 @@ class TestRemovedReleaseEmail:
         assert send_email.delay.calls == [
             pretend.call(
                 "username <email@example.com>",
-                attr.asdict(
-                    EmailMessage(
-                        subject="Email Subject",
-                        body_text="Email Body",
-                        body_html=(
-                            "<html>\n<head></head>\n"
-                            "<body><p>Email HTML Body</p></body>\n</html>\n"
-                        ),
+                {
+                    "subject": "Email Subject",
+                    "body_text": "Email Body",
+                    "body_html": (
+                        "<html>\n<head></head>\n"
+                        "<body><p>Email HTML Body</p></body>\n</html>\n"
                     ),
-                ),
+                },
                 {
                     "tag": "account:email:sent",
                     "user_id": stub_user.id,
@@ -3026,16 +2999,14 @@ class TestRemovedReleaseEmail:
             ),
             pretend.call(
                 "submitterusername <submiteremail@example.com>",
-                attr.asdict(
-                    EmailMessage(
-                        subject="Email Subject",
-                        body_text="Email Body",
-                        body_html=(
-                            "<html>\n<head></head>\n"
-                            "<body><p>Email HTML Body</p></body>\n</html>\n"
-                        ),
-                    )
-                ),
+                {
+                    "subject": "Email Subject",
+                    "body_text": "Email Body",
+                    "body_html": (
+                        "<html>\n<head></head>\n"
+                        "<body><p>Email HTML Body</p></body>\n</html>\n"
+                    ),
+                },
                 {
                     "tag": "account:email:sent",
                     "user_id": stub_submitter_user.id,
@@ -3145,16 +3116,14 @@ class TestRemovedReleaseFileEmail:
         assert send_email.delay.calls == [
             pretend.call(
                 "username <email@example.com>",
-                attr.asdict(
-                    EmailMessage(
-                        subject="Email Subject",
-                        body_text="Email Body",
-                        body_html=(
-                            "<html>\n<head></head>\n"
-                            "<body><p>Email HTML Body</p></body>\n</html>\n"
-                        ),
+                {
+                    "subject": "Email Subject",
+                    "body_text": "Email Body",
+                    "body_html": (
+                        "<html>\n<head></head>\n"
+                        "<body><p>Email HTML Body</p></body>\n</html>\n"
                     ),
-                ),
+                },
                 {
                     "tag": "account:email:sent",
                     "user_id": stub_user.id,
@@ -3169,16 +3138,14 @@ class TestRemovedReleaseFileEmail:
             ),
             pretend.call(
                 "submitterusername <submiteremail@example.com>",
-                attr.asdict(
-                    EmailMessage(
-                        subject="Email Subject",
-                        body_text="Email Body",
-                        body_html=(
-                            "<html>\n<head></head>\n"
-                            "<body><p>Email HTML Body</p></body>\n</html>\n"
-                        ),
-                    )
-                ),
+                {
+                    "subject": "Email Subject",
+                    "body_text": "Email Body",
+                    "body_html": (
+                        "<html>\n<head></head>\n"
+                        "<body><p>Email HTML Body</p></body>\n</html>\n"
+                    ),
+                },
                 {
                     "tag": "account:email:sent",
                     "user_id": stub_submitter_user.id,
@@ -3286,16 +3253,14 @@ class TestRemovedReleaseFileEmail:
         assert send_email.delay.calls == [
             pretend.call(
                 "username <email@example.com>",
-                attr.asdict(
-                    EmailMessage(
-                        subject="Email Subject",
-                        body_text="Email Body",
-                        body_html=(
-                            "<html>\n<head></head>\n"
-                            "<body><p>Email HTML Body</p></body>\n</html>\n"
-                        ),
+                {
+                    "subject": "Email Subject",
+                    "body_text": "Email Body",
+                    "body_html": (
+                        "<html>\n<head></head>\n"
+                        "<body><p>Email HTML Body</p></body>\n</html>\n"
                     ),
-                ),
+                },
                 {
                     "tag": "account:email:sent",
                     "user_id": stub_user.id,
@@ -3310,16 +3275,14 @@ class TestRemovedReleaseFileEmail:
             ),
             pretend.call(
                 "submitterusername <submiteremail@example.com>",
-                attr.asdict(
-                    EmailMessage(
-                        subject="Email Subject",
-                        body_text="Email Body",
-                        body_html=(
-                            "<html>\n<head></head>\n"
-                            "<body><p>Email HTML Body</p></body>\n</html>\n"
-                        ),
-                    )
-                ),
+                {
+                    "subject": "Email Subject",
+                    "body_text": "Email Body",
+                    "body_html": (
+                        "<html>\n<head></head>\n"
+                        "<body><p>Email HTML Body</p></body>\n</html>\n"
+                    ),
+                },
                 {
                     "tag": "account:email:sent",
                     "user_id": stub_submitter_user.id,
@@ -3401,16 +3364,14 @@ class TestTwoFactorEmail:
         assert send_email.delay.calls == [
             pretend.call(
                 f"{stub_user.username} <{stub_user.email}>",
-                attr.asdict(
-                    EmailMessage(
-                        subject="Email Subject",
-                        body_text="Email Body",
-                        body_html=(
-                            "<html>\n<head></head>\n"
-                            "<body><p>Email HTML Body</p></body>\n</html>\n"
-                        ),
-                    )
-                ),
+                {
+                    "subject": "Email Subject",
+                    "body_text": "Email Body",
+                    "body_html": (
+                        "<html>\n<head></head>\n"
+                        "<body><p>Email HTML Body</p></body>\n</html>\n"
+                    ),
+                },
                 {
                     "tag": "account:email:sent",
                     "user_id": stub_user.id,
